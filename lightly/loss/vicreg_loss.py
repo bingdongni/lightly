@@ -165,24 +165,39 @@ def _covariance_rows(x: Tensor, start: int, stop: int) -> Tensor:
 
 
 class _BlockedCovariance(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx: Any, x: Tensor, block_size: int) -> Tensor:
-        ctx.save_for_backward(x)
-        ctx.block_size = block_size
-        total = x.new_zeros(x.shape[1:-1])
-        for start in range(0, x.size(-1), block_size):
-            rows = _covariance_rows(x, start, start + block_size)
-            total = total + rows.square().sum(dim=(-2, -1))
-        ctx.cov_dtype = rows.dtype
-        return total
+    generate_vmap_rule = True
 
     @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> Tuple[Tensor, None]:
+    def forward(x: Tensor, block_size: int) -> Tuple[Tensor, torch.dtype]:
+        acc_dtype = (
+            torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
+        )
+        total = x.new_zeros(x.shape[1:-1], dtype=acc_dtype)
+        for start in range(0, x.size(-1), block_size):
+            rows = _covariance_rows(x, start, start + block_size)
+            squares = rows.pow(2)
+            total = total + squares.sum(dim=(-2, -1), dtype=acc_dtype)
+        # Autocast can use different dtypes for the matrix product and the loss.
+        return (total / x.size(-1)).to(squares.dtype), rows.dtype
+
+    @staticmethod
+    def setup_context(
+        ctx: Any, inputs: Tuple[Tensor, int], output: Tuple[Tensor, torch.dtype]
+    ) -> None:
+        x, ctx.block_size = inputs
+        ctx.cov_dtype = output[1]
+        ctx.loss_dtype = output[0].dtype
+        ctx.save_for_backward(x)
+        if hasattr(ctx, "save_for_forward"):
+            ctx.save_for_forward(x)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor, _: None) -> Tuple[Tensor, None]:
         (centered,) = ctx.saved_tensors
         x = centered.to(ctx.cov_dtype)
         # For centered X and covariance C, the gradient of the squared
         # off-diagonal norm is 4 X offdiag(C) / (N - 1).
-        scale = grad_output[..., None, None] * (2 / (x.size(0) - 1))
+        scale = (grad_output[..., None, None] / x.size(-1)) * (2 / (x.size(0) - 1))
         parts = []
         for start in range(0, x.size(-1), ctx.block_size):
             rows = _covariance_rows(x, start, start + ctx.block_size)
@@ -191,6 +206,26 @@ class _BlockedCovariance(torch.autograd.Function):
             product = torch.einsum("b...d,...cd->b...c", x, scaled_rows)
             parts.append(2 * product.to(centered.dtype))
         return torch.cat(parts, dim=-1), None
+
+    @staticmethod
+    def jvp(ctx: Any, tangent: Tensor, _: None) -> Tuple[Tensor, None]:
+        (x,) = ctx.saved_tensors
+        grad, _block_size = _BlockedCovariance.backward(
+            ctx, x.new_ones(x.shape[1:-1], dtype=ctx.loss_dtype), None
+        )
+        return (grad * tangent).sum(dim=(0, -1)).to(ctx.loss_dtype), None
+
+
+class _LegacyBlockedCovariance(torch.autograd.Function):
+    """Adapter for PyTorch versions without the separate setup_context API."""
+
+    @staticmethod
+    def forward(ctx: Any, x: Tensor, block_size: int) -> Tuple[Tensor, torch.dtype]:
+        output = _BlockedCovariance.forward(x, block_size)
+        _BlockedCovariance.setup_context(ctx, (x, block_size), output)
+        return output
+
+    backward = staticmethod(_BlockedCovariance.backward)
 
 
 def covariance_loss(x: Tensor, block_size: Optional[int] = None) -> Tensor:
@@ -214,8 +249,14 @@ def covariance_loss(x: Tensor, block_size: Optional[int] = None) -> Tensor:
         if block_size < 1:
             raise ValueError("covariance block size must be positive")
         if block_size < dim:
-            squared_norm: Tensor = _BlockedCovariance.apply(x, block_size)
-            return (squared_norm / dim).mean()
+            fn = (
+                _BlockedCovariance
+                if hasattr(torch.autograd.Function, "setup_context")
+                else _LegacyBlockedCovariance
+            )
+            loss: Tensor
+            loss, _ = fn.apply(x, block_size)
+            return loss.mean()
 
     # nondiag_mask has shape (dim, dim) with 1s on all non-diagonal entries.
     nondiag_mask = ~torch.eye(dim, device=x.device, dtype=torch.bool)

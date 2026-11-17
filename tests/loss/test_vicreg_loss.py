@@ -30,6 +30,40 @@ class TestVICRegLoss:
         x = torch.randn(4, 5, dtype=torch.double, requires_grad=True)
         assert torch.autograd.gradgradcheck(lambda v: covariance_loss(v, 2), (x,))
 
+    def test_blocked_covariance_func(self) -> None:
+        func = pytest.importorskip("torch.func")
+        from lightly.loss.vicreg_loss import covariance_loss
+
+        x = torch.randn(2, 5, 3, 7, dtype=torch.double)
+        tangent = torch.randn_like(x[0])
+
+        def blocked(v: Tensor) -> Tensor:
+            return covariance_loss(v, 2)
+
+        for transform in (func.grad, func.jacrev, func.jacfwd):
+            torch.testing.assert_close(
+                transform(blocked)(x[0]), transform(covariance_loss)(x[0])
+            )
+        torch.testing.assert_close(
+            func.vmap(func.grad(blocked))(x), func.vmap(func.grad(covariance_loss))(x)
+        )
+        torch.testing.assert_close(
+            func.jvp(blocked, (x[0],), (tangent,)),
+            func.jvp(covariance_loss, (x[0],), (tangent,)),
+        )
+
+    @pytest.mark.parametrize(
+        "dtype,width", [(torch.float16, 4096), (torch.bfloat16, 512)]
+    )
+    def test_blocked_covariance_low_precision_accumulation(
+        self, dtype: torch.dtype, width: int
+    ) -> None:
+        from lightly.loss.vicreg_loss import covariance_loss
+
+        row = torch.full((width,), 0.5 / width**0.25, dtype=dtype)
+        x = torch.stack((row, -row))
+        torch.testing.assert_close(covariance_loss(x, 1), covariance_loss(x))
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA autocast")
     @pytest.mark.parametrize("small_embeddings", [True, False])
     def test_blocked_covariance_loss_scaling(self, small_embeddings: bool) -> None:
